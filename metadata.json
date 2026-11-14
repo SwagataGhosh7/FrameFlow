@@ -1,0 +1,6 @@
+{
+  "name": "Frameflow",
+  "description": "Prompt-less screenplay to visual storyboard studio with character continuity and PDF export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
