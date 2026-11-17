@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
-import { Check, Copy, RefreshCw, X } from 'lucide-react';
+import { Check, Copy, ImageDown, Loader2, RefreshCw, X } from 'lucide-react';
 import type { AspectRatio, StoryboardPanel } from '../types/storyboard';
+import { exportPanelAsPng } from '../utils/pngExport';
 import { PanelArtwork } from './PanelArtwork';
 
 interface LightboxModalProps {
   panel: StoryboardPanel | null;
+  projectTitle: string;
   aspectRatio: AspectRatio;
   showGuides: boolean;
   onClose: () => void;
@@ -13,6 +15,7 @@ interface LightboxModalProps {
 
 export function LightboxModal({
   panel,
+  projectTitle,
   aspectRatio,
   showGuides,
   onClose,
@@ -20,6 +23,7 @@ export function LightboxModal({
 }: LightboxModalProps) {
   const [editedPrompt, setEditedPrompt] = useState('');
   const [copied, setCopied] = useState(false);
+  const [isExportingPng, setIsExportingPng] = useState(false);
 
   useEffect(() => {
     if (panel) {
@@ -147,23 +151,46 @@ export function LightboxModal({
               </div>
             </div>
 
-            <div className="flex items-center justify-end gap-3 border-t border-neutral-200 pt-4 dark:border-neutral-800">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-neutral-200 pt-4 dark:border-neutral-800">
               <button
                 type="button"
-                onClick={onClose}
-                className="rounded-lg border border-neutral-200 px-4 py-2 text-sm font-medium text-neutral-700 transition-colors hover:bg-neutral-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800 whitespace-nowrap shrink-0"
+                disabled={isRendering || isExportingPng || (!panel.imageUrl && !panel.svgMarkup)}
+                onClick={async () => {
+                  setIsExportingPng(true);
+                  try {
+                    await exportPanelAsPng({ panel, aspectRatio, projectTitle });
+                  } finally {
+                    setIsExportingPng(false);
+                  }
+                }}
+                className="inline-flex items-center gap-2 rounded-lg border border-neutral-200 px-3.5 py-2 text-sm font-medium text-neutral-700 transition-colors hover:bg-neutral-50 disabled:opacity-45 dark:border-neutral-700 dark:text-neutral-200 dark:hover:bg-neutral-800 whitespace-nowrap shrink-0"
               >
-                Close
+                {isExportingPng ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <ImageDown className="h-4 w-4" />
+                )}
+                <span>{isExportingPng ? 'Exporting...' : 'Download PNG'}</span>
               </button>
-              <button
-                type="button"
-                disabled={isRendering || !editedPrompt.trim()}
-                onClick={() => onRegeneratePanel(panel.panel_number, editedPrompt)}
-                className="inline-flex items-center gap-2 rounded-lg bg-[#D94E28] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#C2411E] disabled:opacity-50 whitespace-nowrap shrink-0"
-              >
-                <RefreshCw className={`h-4 w-4 ${isRendering ? 'animate-spin' : ''}`} />
-                <span>{isRendering ? 'Rendering...' : 'Regenerate Panel'}</span>
-              </button>
+
+              <div className="flex items-center gap-2.5">
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="rounded-lg border border-neutral-200 px-4 py-2 text-sm font-medium text-neutral-700 transition-colors hover:bg-neutral-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800 whitespace-nowrap shrink-0"
+                >
+                  Close
+                </button>
+                <button
+                  type="button"
+                  disabled={isRendering || !editedPrompt.trim()}
+                  onClick={() => onRegeneratePanel(panel.panel_number, editedPrompt)}
+                  className="inline-flex items-center gap-2 rounded-lg bg-[#D94E28] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#C2411E] disabled:opacity-50 whitespace-nowrap shrink-0"
+                >
+                  <RefreshCw className={`h-4 w-4 ${isRendering ? 'animate-spin' : ''}`} />
+                  <span>{isRendering ? 'Rendering...' : 'Regenerate Panel'}</span>
+                </button>
+              </div>
             </div>
           </div>
         </div>

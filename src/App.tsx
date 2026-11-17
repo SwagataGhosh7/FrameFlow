@@ -7,6 +7,7 @@ import {
   FileText,
   Film,
   Grid2x2,
+  ImageDown,
   Loader2,
   Moon,
   Plus,
@@ -29,6 +30,7 @@ import type {
   StoryboardProject,
 } from './types/storyboard';
 import { exportStoryboardPdf } from './utils/pdfExport';
+import { exportPanelAsPng } from './utils/pngExport';
 
 type AppSection = 'workspace' | 'json' | 'characters' | 'library';
 type BoardViewMode = 'grid' | 'presentation' | 'sheet';
@@ -42,6 +44,24 @@ const ART_STYLES: ArtStyle[] = [
 ];
 
 const ASPECT_RATIOS: AspectRatio[] = ['16:9', '4:3', '2.39:1'];
+
+async function readJsonSafe<T>(res: Response): Promise<T> {
+  const text = await res.text();
+  const trimmed = text.trim();
+  if (!trimmed) {
+    throw new Error(`Empty response from server (HTTP ${res.status}).`);
+  }
+  if (trimmed.startsWith('<')) {
+    throw new Error(
+      `Server returned an HTML page instead of JSON (HTTP ${res.status}). Please refresh or retry in a few seconds.`,
+    );
+  }
+  try {
+    return JSON.parse(trimmed) as T;
+  } catch {
+    throw new Error(`Invalid JSON response from server (HTTP ${res.status}).`);
+  }
+}
 
 export default function App() {
   const initialSample = SAMPLE_SCRIPTS[0];
@@ -73,6 +93,7 @@ export default function App() {
 
   const [lightboxPanelNumber, setLightboxPanelNumber] = useState<number | null>(null);
   const [copiedPromptIndex, setCopiedPromptIndex] = useState<number | null>(null);
+  const [exportingPngPanel, setExportingPngPanel] = useState<number | null>(null);
   const [copiedJson, setCopiedJson] = useState(false);
 
   const [savedProjects, setSavedProjects] = useState<StoryboardProject[]>([]);
@@ -90,7 +111,7 @@ export default function App() {
   useEffect(() => {
     void fetchSavedProjects();
     void fetch('/api/capabilities')
-      .then((res) => (res.ok ? res.json() : null))
+      .then((res) => (res.ok ? readJsonSafe<typeof capabilities>(res) : null))
       .then((data) => {
         if (data) setCapabilities(data);
       })
@@ -102,7 +123,7 @@ export default function App() {
     try {
       const res = await fetch('/api/projects');
       if (!res.ok) return;
-      const data = await res.json();
+      const data = await readJsonSafe<{ projects?: StoryboardProject[] }>(res);
       if (Array.isArray(data.projects)) {
         setSavedProjects(data.projects);
       }
@@ -202,7 +223,11 @@ export default function App() {
         }),
       });
 
-      const data = await res.json();
+      const data = await readJsonSafe<{
+        imageUrl?: string;
+        svgMarkup?: string;
+        error?: string;
+      }>(res);
       if (!res.ok) {
         throw new Error(data.error || 'Failed to render storyboard frame.');
       }
@@ -250,7 +275,10 @@ export default function App() {
         }),
       });
 
-      const parseData = await parseRes.json();
+      const parseData = await readJsonSafe<{
+        storyboard?: StoryboardPanel[];
+        error?: string;
+      }>(parseRes);
       if (!parseRes.ok) {
         throw new Error(parseData.error || 'Unable to parse screenplay.');
       }
@@ -339,7 +367,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = await res.json();
+      const data = await readJsonSafe<{ project?: StoryboardProject; error?: string }>(res);
       if (!res.ok) {
         throw new Error(data.error || 'Failed to save storyboard.');
       }
@@ -391,6 +419,23 @@ export default function App() {
       setErrorBanner(err instanceof Error ? err.message : 'PDF export failed.');
     } finally {
       setIsExportingPdf(false);
+    }
+  };
+
+  const handleDownloadPanelPng = async (panel: StoryboardPanel) => {
+    if (exportingPngPanel !== null) return;
+    setExportingPngPanel(panel.panel_number);
+    setErrorBanner(null);
+    try {
+      await exportPanelAsPng({
+        panel,
+        aspectRatio,
+        projectTitle: projectTitle.trim() || 'frameflow',
+      });
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : 'PNG export failed.');
+    } finally {
+      setExportingPngPanel(null);
     }
   };
 
@@ -827,6 +872,7 @@ export default function App() {
               ) : boardViewMode === 'presentation' ? (
                 <PresentationView
                   panels={panels}
+                  projectTitle={projectTitle.trim() || 'frameflow'}
                   aspectRatio={aspectRatio}
                   showGuides={showGuides}
                 />
@@ -840,7 +886,7 @@ export default function App() {
                           <th className="px-4 py-3 font-medium">Scene Heading</th>
                           <th className="px-4 py-3 font-medium">Action Summary</th>
                           <th className="px-4 py-3 font-medium">FLUX.1 Image Prompt</th>
-                          <th className="px-4 py-3 text-right font-medium">Copy</th>
+                          <th className="px-4 py-3 text-right font-medium">Actions</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-neutral-200 dark:divide-neutral-800">
@@ -862,18 +908,39 @@ export default function App() {
                               {panel.image_prompt}
                             </td>
                             <td className="px-4 py-3 text-right align-top">
-                              <button
-                                type="button"
-                                onClick={() => handleCopyPrompt(panel.panel_number, panel.image_prompt)}
-                                className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-neutral-200 text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
-                                aria-label={`Copy prompt for panel ${panel.panel_number}`}
-                              >
-                                {copiedPromptIndex === panel.panel_number ? (
-                                  <Check className="h-3.5 w-3.5 text-emerald-600" />
-                                ) : (
-                                  <Copy className="h-3.5 w-3.5" />
-                                )}
-                              </button>
+                              <div className="inline-flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  disabled={
+                                    exportingPngPanel === panel.panel_number ||
+                                    panel.renderStatus === 'rendering' ||
+                                    (!panel.imageUrl && !panel.svgMarkup)
+                                  }
+                                  onClick={() => handleDownloadPanelPng(panel)}
+                                  className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-neutral-200 text-neutral-600 hover:bg-neutral-100 disabled:opacity-40 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                                  title="Download as PNG"
+                                  aria-label={`Download panel ${panel.panel_number} as PNG`}
+                                >
+                                  {exportingPngPanel === panel.panel_number ? (
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  ) : (
+                                    <ImageDown className="h-3.5 w-3.5" />
+                                  )}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleCopyPrompt(panel.panel_number, panel.image_prompt)}
+                                  className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-neutral-200 text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                                  title="Copy FLUX.1 prompt"
+                                  aria-label={`Copy prompt for panel ${panel.panel_number}`}
+                                >
+                                  {copiedPromptIndex === panel.panel_number ? (
+                                    <Check className="h-3.5 w-3.5 text-emerald-600" />
+                                  ) : (
+                                    <Copy className="h-3.5 w-3.5" />
+                                  )}
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         ))}
@@ -901,20 +968,42 @@ export default function App() {
                           </h3>
                         </div>
 
-                        <button
-                          type="button"
-                          onClick={() => renderSinglePanel(panel, artStyle, aspectRatio)}
-                          disabled={panel.renderStatus === 'rendering'}
-                          className="inline-flex h-7 w-7 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-neutral-100 hover:text-neutral-900 disabled:opacity-40 dark:text-neutral-400 dark:hover:bg-neutral-800 dark:hover:text-neutral-100 shrink-0"
-                          title="Re-render panel artwork"
-                          aria-label={`Re-render panel ${panel.panel_number}`}
-                        >
-                          <RefreshCw
-                            className={`h-3.5 w-3.5 ${
-                              panel.renderStatus === 'rendering' ? 'animate-spin' : ''
-                            }`}
-                          />
-                        </button>
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleDownloadPanelPng(panel)}
+                            disabled={
+                              exportingPngPanel === panel.panel_number ||
+                              panel.renderStatus === 'rendering' ||
+                              (!panel.imageUrl && !panel.svgMarkup)
+                            }
+                            className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-[11px] font-medium text-neutral-600 transition-colors hover:bg-neutral-100 hover:text-neutral-900 disabled:opacity-40 dark:text-neutral-400 dark:hover:bg-neutral-800 dark:hover:text-neutral-100 whitespace-nowrap shrink-0"
+                            title="Download as PNG"
+                            aria-label={`Download panel ${panel.panel_number} as PNG`}
+                          >
+                            {exportingPngPanel === panel.panel_number ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <ImageDown className="h-3.5 w-3.5" />
+                            )}
+                            <span>PNG</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => renderSinglePanel(panel, artStyle, aspectRatio)}
+                            disabled={panel.renderStatus === 'rendering'}
+                            className="inline-flex h-7 w-7 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-neutral-100 hover:text-neutral-900 disabled:opacity-40 dark:text-neutral-400 dark:hover:bg-neutral-800 dark:hover:text-neutral-100 shrink-0"
+                            title="Re-render panel artwork"
+                            aria-label={`Re-render panel ${panel.panel_number}`}
+                          >
+                            <RefreshCw
+                              className={`h-3.5 w-3.5 ${
+                                panel.renderStatus === 'rendering' ? 'animate-spin' : ''
+                              }`}
+                            />
+                          </button>
+                        </div>
                       </div>
 
                       <PanelArtwork
@@ -1159,6 +1248,7 @@ export default function App() {
 
       <LightboxModal
         panel={lightboxPanel}
+        projectTitle={projectTitle.trim() || 'frameflow'}
         aspectRatio={aspectRatio}
         showGuides={showGuides}
         onClose={() => setLightboxPanelNumber(null)}

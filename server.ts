@@ -2,7 +2,7 @@ import 'dotenv/config';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import express from 'express';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const DATA_DIR = path.join(process.cwd(), 'data');
@@ -65,6 +65,109 @@ function sanitizeSvg(rawSvg: string, width: number, height: number): string | nu
   return svg;
 }
 
+function isTransientGeminiError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return (
+    msg.includes('503') ||
+    msg.includes('429') ||
+    msg.includes('UNAVAILABLE') ||
+    msg.includes('RESOURCE_EXHAUSTED') ||
+    msg.includes('high demand') ||
+    msg.includes('overloaded') ||
+    msg.includes('timed out') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('ETIMEDOUT')
+  );
+}
+
+function formatGeminiErrorMessage(error: unknown, fallback: string): string {
+  const raw = error instanceof Error ? error.message : String(error || fallback);
+  if (raw.includes('503') || raw.includes('UNAVAILABLE') || raw.includes('high demand')) {
+    return 'Gemini is temporarily experiencing high demand (503). Automatic retries and fallback were attempted — please try again in a few seconds.';
+  }
+  if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED')) {
+    return 'Rate limit reached (429). Please wait a moment before generating again.';
+  }
+  if (raw.includes('API_KEY_INVALID') || raw.includes('PERMISSION_DENIED')) {
+    return 'API key error. Please verify GEMINI_API_KEY in Settings > Secrets.';
+  }
+  return raw;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms),
+    ),
+  ]);
+}
+
+let hydrogenCooldownUntil = 0;
+
+async function generateWithFallback(
+  ai: GoogleGenAI,
+  params: {
+    contents: string;
+    config?: Record<string, unknown>;
+  },
+) {
+  const now = Date.now();
+  const skipHydrogen = now < hydrogenCooldownUntil;
+
+  const attempts: Array<{ model: string; delayMs: number; useLowThinking: boolean }> = skipHydrogen
+    ? [
+        { model: 'gemini-3.1-flash-lite', delayMs: 0, useLowThinking: false },
+        { model: 'gemini-3.1-flash-lite', delayMs: 800, useLowThinking: false },
+      ]
+    : [
+        { model: 'gemini-4-hydrogen', delayMs: 0, useLowThinking: true },
+        { model: 'gemini-3.1-flash-lite', delayMs: 300, useLowThinking: false },
+        { model: 'gemini-3.1-flash-lite', delayMs: 900, useLowThinking: false },
+      ];
+
+  let lastError: unknown;
+
+  for (const attempt of attempts) {
+    if (attempt.delayMs > 0) {
+      await sleep(attempt.delayMs);
+    }
+
+    try {
+      const config = attempt.useLowThinking
+        ? {
+            ...(params.config ?? {}),
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          }
+        : params.config;
+
+      return await withTimeout(
+        ai.models.generateContent({
+          model: attempt.model,
+          contents: params.contents,
+          config,
+        }),
+        attempt.model === 'gemini-4-hydrogen' ? 12000 : 35000,
+        attempt.model,
+      );
+    } catch (error) {
+      lastError = error;
+      if (attempt.model === 'gemini-4-hydrogen' && isTransientGeminiError(error)) {
+        hydrogenCooldownUntil = Date.now() + 300_000;
+      }
+      if (!isTransientGeminiError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError;
+}
+
 function buildFallbackSvg(
   sceneHeading: string,
   actionSummary: string,
@@ -72,12 +175,36 @@ function buildFallbackSvg(
   aspectRatio: string,
 ): string {
   const { width, height } = getDimensionsForRatio(aspectRatio);
+  const text = `${sceneHeading} ${actionSummary}`.toLowerCase();
   const isNoir = artStyle === 'Noir Ink Wash' || artStyle === 'Charcoal Sketch';
-  const bgTop = isNoir ? '#181A1F' : '#1E2733';
-  const bgBottom = isNoir ? '#383C45' : '#4A392E';
-  const accent = isNoir ? '#D4D7DD' : '#E89B4C';
-  const horizonY = Math.round(height * 0.64);
-  const safeHeading = sceneHeading.replace(/[<>&"]/g, '');
+  const isNight = text.includes('night') || text.includes('space') || text.includes('dark');
+  const isRain = text.includes('rain') || text.includes('wet') || text.includes('drizzle');
+  const isSpace = text.includes('space') || text.includes('orbital') || text.includes('airlock');
+  const isInterior = text.includes('int.');
+
+  const bgTop = isNoir ? '#14161B' : isSpace ? '#0B1220' : isNight ? '#111622' : '#243242';
+  const bgBottom = isNoir ? '#32363F' : isSpace ? '#1C2B42' : isNight ? '#262E3D' : '#584435';
+  const accent = isNoir ? '#D4D7DD' : isSpace ? '#4FB3E8' : '#E89B4C';
+  const horizonY = Math.round(height * 0.65);
+
+  const rainLines = isRain
+    ? Array.from({ length: 18 }, (_, i) => {
+        const x = Math.round((width / 18) * i + 20);
+        const y = (i * 53) % Math.round(height * 0.55);
+        return `<line x1="${x}" y1="${y}" x2="${x - 14}" y2="${y + 42}" stroke="#C5D5E8" stroke-opacity="0.22" stroke-width="1.2" />`;
+      }).join('')
+    : '';
+
+  const environmentLayer = isSpace
+    ? `<circle cx="${width * 0.72}" cy="${height * 0.34}" r="${Math.round(height * 0.24)}" fill="${accent}" fill-opacity="0.22" stroke="${accent}" stroke-opacity="0.45" stroke-width="1.5" />
+       <ellipse cx="${width * 0.72}" cy="${height * 0.34}" rx="${Math.round(height * 0.42)}" ry="${Math.round(height * 0.07)}" fill="none" stroke="${accent}" stroke-opacity="0.35" stroke-width="2" transform="rotate(-12 ${width * 0.72} ${height * 0.34})" />`
+    : isInterior
+      ? `<rect x="${width * 0.08}" y="${height * 0.14}" width="${width * 0.26}" height="${height * 0.42}" fill="${accent}" fill-opacity="0.16" stroke="#ffffff" stroke-opacity="0.18" stroke-width="2" />
+         <rect x="${width * 0.66}" y="${height * 0.14}" width="${width * 0.26}" height="${height * 0.42}" fill="${accent}" fill-opacity="0.12" stroke="#ffffff" stroke-opacity="0.14" stroke-width="2" />`
+      : `<rect x="${width * 0.09}" y="${horizonY - 140}" width="64" height="140" fill="#10131A" opacity="0.82" />
+         <rect x="${width * 0.21}" y="${horizonY - 190}" width="78" height="190" fill="#0E1117" opacity="0.72" />
+         <rect x="${width * 0.71}" y="${horizonY - 165}" width="84" height="165" fill="#10131A" opacity="0.8" />
+         <rect x="${width * 0.84}" y="${horizonY - 115}" width="58" height="115" fill="#0E1117" opacity="0.75" />`;
 
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="100%" height="100%" preserveAspectRatio="xMidYMid slice">
   <defs>
@@ -85,25 +212,24 @@ function buildFallbackSvg(
       <stop offset="0%" stop-color="${bgTop}" />
       <stop offset="100%" stop-color="${bgBottom}" />
     </linearGradient>
-    <radialGradient id="lightCone" cx="68%" cy="28%" r="55%">
-      <stop offset="0%" stop-color="${accent}" stop-opacity="0.42" />
+    <radialGradient id="lightCone" cx="65%" cy="28%" r="58%">
+      <stop offset="0%" stop-color="${accent}" stop-opacity="0.38" />
       <stop offset="100%" stop-color="${accent}" stop-opacity="0" />
     </radialGradient>
   </defs>
   <rect width="${width}" height="${height}" fill="url(#skyGrad)" />
   <rect width="${width}" height="${height}" fill="url(#lightCone)" />
-  <polygon points="0,${horizonY} ${width},${horizonY} ${width},${height} 0,${height}" fill="#0D0F14" opacity="0.88" />
+  ${environmentLayer}
+  <polygon points="0,${horizonY} ${width},${horizonY} ${width},${height} 0,${height}" fill="#0C0E13" opacity="0.9" />
   <line x1="0" y1="${horizonY}" x2="${width}" y2="${horizonY}" stroke="${accent}" stroke-opacity="0.35" stroke-width="1.5" />
   <line x1="${width * 0.5}" y1="${horizonY}" x2="0" y2="${height}" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1" />
   <line x1="${width * 0.5}" y1="${horizonY}" x2="${width}" y2="${height}" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1" />
-  <rect x="${width * 0.14}" y="${horizonY - 120}" width="54" height="120" fill="#121419" opacity="0.85" />
-  <rect x="${width * 0.72}" y="${horizonY - 150}" width="72" height="150" fill="#121419" opacity="0.78" />
-  <g transform="translate(${width * 0.38}, ${horizonY - 95})">
-    <ellipse cx="22" cy="18" rx="14" ry="16" fill="#0A0C10" />
-    <path d="M4,40 Q22,30 40,40 L48,118 L-4,118 Z" fill="#0A0C10" />
-    <path d="M4,40 Q22,30 40,40" stroke="${accent}" stroke-width="2" fill="none" opacity="0.75" />
+  ${rainLines}
+  <g transform="translate(${width * 0.36}, ${horizonY - 105})">
+    <ellipse cx="26" cy="20" rx="15" ry="17" fill="#080A0E" />
+    <path d="M4,44 Q26,32 48,44 L56,130 L-4,130 Z" fill="#080A0E" />
+    <path d="M6,44 Q26,33 46,44" stroke="${accent}" stroke-width="2" fill="none" opacity="0.7" />
   </g>
-  <text x="28" y="${height - 24}" fill="#ffffff" fill-opacity="0.45" font-family="monospace" font-size="13">${safeHeading} — ${actionSummary.slice(0, 62).replace(/[<>&"]/g, '')}</text>
 </svg>`;
 }
 
@@ -155,8 +281,7 @@ async function startServer() {
       }
 
       const ai = getGeminiClient();
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+      const response = await generateWithFallback(ai, {
         contents: `Visual Art Style requested: ${artStyle}
 Target Frame Aspect Ratio: ${aspectRatio}
 
@@ -214,7 +339,11 @@ Break this text into sequential storyboard panels (between 2 and 10 panels depen
         },
       });
 
-      const rawText = (response.text ?? '{}').trim();
+      const rawText = (response.text ?? '{}')
+        .trim()
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/```\s*$/i, '')
+        .trim();
       const parsed = JSON.parse(rawText);
 
       if (!parsed || !Array.isArray(parsed.storyboard) || parsed.storyboard.length === 0) {
@@ -224,9 +353,10 @@ Break this text into sequential storyboard panels (between 2 and 10 panels depen
 
       res.json(parsed);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to parse screenplay.';
+      const status = isTransientGeminiError(error) ? 503 : 500;
+      const message = formatGeminiErrorMessage(error, 'Failed to parse screenplay.');
       console.error('Storyboard parse error:', message);
-      res.status(500).json({ error: message });
+      res.status(status).json({ error: message });
     }
   });
 
@@ -384,7 +514,7 @@ VISUAL STYLE: ${artStyle} — ${styleGuidance}
 
 Strict technical requirements for the SVG:
 1. Root element must be <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}"> and end with </svg>.
-2. Draw a rich, multi-layered visual composition:
+2. Keep the SVG compact and fast to render (roughly 18-35 clean primitives total) with 4 crisp visual layers:
    - Layer 1: Sky/wall/backdrop with <linearGradient> or <radialGradient> lighting.
    - Layer 2: Perspective architecture, horizon, windows, skyline, trees, or interior furniture using clean <path>, <polygon>, <rect>, <line> elements.
    - Layer 3: Lighting atmosphere (volumetric sunbeams, window light cones, rain streaks, mist ellipses, reflections).
@@ -393,15 +523,20 @@ Strict technical requirements for the SVG:
 4. Do NOT include <script> tags or external URLs.
 5. Output ONLY the raw <svg>...</svg> markup, with no markdown fences or explanation.`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: svgPrompt,
-      });
+      try {
+        const response = await generateWithFallback(ai, {
+          contents: svgPrompt,
+        });
 
-      const sanitized = sanitizeSvg(response.text ?? '', width, height);
-      if (sanitized) {
-        res.json({ svgMarkup: sanitized, engine: 'svg' });
-        return;
+        const sanitized = sanitizeSvg(response.text ?? '', width, height);
+        if (sanitized) {
+          res.json({ svgMarkup: sanitized, engine: 'svg' });
+          return;
+        }
+      } catch (llmError) {
+        if (!isTransientGeminiError(llmError)) {
+          throw llmError;
+        }
       }
 
       res.json({
@@ -409,9 +544,10 @@ Strict technical requirements for the SVG:
         engine: 'svg',
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to render storyboard panel.';
+      const status = isTransientGeminiError(error) ? 503 : 500;
+      const message = formatGeminiErrorMessage(error, 'Failed to render storyboard panel.');
       console.error('Panel render error:', message);
-      res.status(500).json({ error: message });
+      res.status(status).json({ error: message });
     }
   });
 
@@ -468,6 +604,23 @@ Strict technical requirements for the SVG:
       res.status(500).json({ error: message });
     }
   });
+
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found.' });
+  });
+
+  app.use(
+    '/api',
+    (
+      err: unknown,
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction,
+    ) => {
+      const message = err instanceof Error ? err.message : 'Unexpected server error.';
+      res.status(500).json({ error: message });
+    },
+  );
 
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');

@@ -1,17 +1,20 @@
 import { useEffect, useState } from 'react';
-import { ChevronLeft, ChevronRight, Pause, Play } from 'lucide-react';
+import { ChevronLeft, ChevronRight, ImageDown, Loader2, Pause, Play } from 'lucide-react';
 import type { AspectRatio, StoryboardPanel } from '../types/storyboard';
+import { exportPanelAsPng } from '../utils/pngExport';
 import { PanelArtwork } from './PanelArtwork';
 
 interface PresentationViewProps {
   panels: StoryboardPanel[];
+  projectTitle: string;
   aspectRatio: AspectRatio;
   showGuides: boolean;
 }
 
-export function PresentationView({ panels, aspectRatio, showGuides }: PresentationViewProps) {
+export function PresentationView({ panels, projectTitle, aspectRatio, showGuides }: PresentationViewProps) {
   const [activeIndex, setActiveIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isExportingPng, setIsExportingPng] = useState(false);
 
   const safeIndex = Math.min(activeIndex, Math.max(0, panels.length - 1));
   const currentPanel = panels[safeIndex];
@@ -101,6 +104,32 @@ export function PresentationView({ panels, aspectRatio, showGuides }: Presentati
               aria-label="Next panel"
             >
               <ChevronRight className="h-4 w-4" />
+            </button>
+
+            <button
+              type="button"
+              disabled={isExportingPng || (!currentPanel.imageUrl && !currentPanel.svgMarkup)}
+              onClick={async () => {
+                setIsExportingPng(true);
+                try {
+                  await exportPanelAsPng({
+                    panel: currentPanel,
+                    aspectRatio,
+                    projectTitle,
+                  });
+                } finally {
+                  setIsExportingPng(false);
+                }
+              }}
+              className="inline-flex h-10 items-center gap-2 rounded-lg border border-white/15 px-3.5 text-xs font-medium text-neutral-200 transition-colors hover:bg-white/10 disabled:opacity-40 whitespace-nowrap shrink-0"
+              title="Download active panel as PNG"
+            >
+              {isExportingPng ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <ImageDown className="h-3.5 w-3.5" />
+              )}
+              <span>Download PNG</span>
             </button>
           </div>
         </div>
